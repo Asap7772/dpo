@@ -1,0 +1,11 @@
+ipykernel
+numpy
+tokenizers
+torch
+tqdm
+transformers
+datasets
+wandb
+beautifulsoup4==4.12.2
+hydra-core==1.3.2
+tensor-parallel==1.2.4
