@@ -3,10 +3,18 @@ lrs=(0.0000005)
 batch_size=32
 eval_batch_size=4
 gradient_accumulation_steps=8
+exp_num=0
+which_exp=${1:--1}
+
 chkpt='/iris/u/asap7772/trl/output_checkpoints/checkpoint-7500'
 
 for lr in "${lrs[@]}"; do
 for beta in "${betas[@]}"; do
+    if [[ $exp_num != $which_exp && $which_exp -ge 0 ]]; then
+        exp_num=$((exp_num+1))
+        continue
+    fi
+    exp_num=$((exp_num+1))
     command="python -u train.py \
         model=pythia14 \
         datasets=[af] \

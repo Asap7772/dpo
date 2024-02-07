@@ -9,6 +9,7 @@ import random
 from bs4 import BeautifulSoup, NavigableString
 import numpy as np
 from typing import Dict, List, Optional, Iterator, Callable, Union, Tuple
+from functools import reduce
 
 
 def extract_anthropic_prompt(prompt_and_response):
@@ -159,9 +160,130 @@ def get_hh(split: str, silent: bool = False, cache_dir: str = None) -> Dict[str,
 
     return data
 
-def get_af(split: str, silent: bool = False, cache_dir: str = None) -> Dict[str, Dict[str, Union[List[Tuple[int, int]], List[str], str]]]:
-    pass
+import os
+from datasets import concatenate_datasets, load_dataset, load_from_disk, DatasetDict
+import re
 
+def get_dataset(path, num_samples=-1, return_test_data=True, num_samples_test=1000):
+    assert os.path.exists(path)
+    folders = os.listdir(path)
+    regex = r"^\d+-\d+$"
+    folders = [x for x in folders if re.search(regex, x)]
+    folders.sort(key=lambda x: int(x.split("-")[0]))
+    total_samples = int(folders[-1].split("-")[-1])
+
+    assert 0 < num_samples <= total_samples - num_samples_test, f"num_samples {num_samples} must be between 0 and {total_samples} - {num_samples_test}"
+    assert 0 < num_samples_test <= total_samples, f"num_samples_test {num_samples_test} must be between 0 and {total_samples}"
+    
+    num_samples_train = num_samples if num_samples > 0 else total_samples - num_samples_test
+    test_folders = [x for x in folders if int(x.split("-")[0]) >= num_samples_train]
+    folders = [x for x in folders if int(x.split("-")[0]) < num_samples_train]
+    
+    datasets = [load_from_disk(os.path.join(path, x)) for x in folders]
+    full_data =  concatenate_datasets(datasets)
+    
+    if num_samples > 0:
+        full_data = full_data.select(range(num_samples))
+        
+    if return_test_data:
+        test_datasets = [load_from_disk(os.path.join(path, x)) for x in test_folders]
+        test_data = concatenate_datasets(test_datasets)
+        if num_samples_test > 0:
+            test_data = test_data.select(range(num_samples_test))
+        return full_data, test_data
+    
+    return full_data
+    
+
+def construct_dataset(
+    path,
+    num_samples=-1,
+    concatenate_prompt=False,
+    num_samples_test=1000,
+):
+    data, test_data = get_dataset(path, num_samples=num_samples, return_test_data=True, num_samples_test=num_samples_test)
+
+    if concatenate_prompt:
+        def map_fn(d):
+            for k in ["y_ref", "y_w", "y_l"]:
+                d[k] = d["prompt"] + d[k]
+            return d
+        
+        data = data.map(map_fn, num_proc=32)
+
+    dataset_name = os.path.basename(path).split(".")[0]
+
+    ds = DatasetDict(
+        {
+            "train": data,
+            "test": test_data,
+        }
+    ) 
+    return dataset_name, ds
+
+PROMPT_TOKEN = '<|prompter|>'
+ASSISTANT_TOKEN = '<|assistant|>'
+EOS_TOKEN = '<|endoftext|>'
+
+def get_af(split: str, silent: bool = False, cache_dir: str = None) -> Dict[str, Dict[str, Union[List[Tuple[int, int]], List[str], str]]]:
+    dataset_path = '/scratch/bcfp/asingh15/conservative_reward_model/data/preference_datasets/relabeled_alpacafarm_pythiasft_20K_preference_data'
+    preference_num_samples=19000
+
+    pref_dataset_name, pref_dataset = construct_dataset(
+        path=dataset_path,
+        num_samples=preference_num_samples,
+        concatenate_prompt=False,
+    )
+    print('Loaded dataset', pref_dataset_name)
+    pref_dataset, eval_pref_dataset = pref_dataset['train'], pref_dataset['test']
+    remove_columns = ['output', 'text', 'alpaca_text', 'y_ref', 'y_1', 'y_2', 'y_w', 'y_w_alpaca', 'y_l', 'y_l_alpaca', 'y_w_score', 'y_l_score', 'score_diff', 'prompt', 'alpaca_prompt']
+    
+    def process_dataset(batch):
+        new_batch = {}
+        new_batch['query'] = batch['prompt']
+        new_batch['text_w'] =  batch['y_w'] 
+        new_batch['text_l'] = batch['y_l']
+        new_batch['response_w'] = [x.split(ASSISTANT_TOKEN)[-1] for x in batch['y_w']]
+        new_batch['response_l'] = [x.split(ASSISTANT_TOKEN)[-1] for x in batch['y_l']]
+        
+        shapes = {}
+        for k, v in new_batch.items():
+            shapes[k] = len(v)
+        if reduce(lambda x,y: x if x==y else -1, list(shapes.values())) == -1:
+            assert False, f"Shapes of all columns must be equal, but got {shapes}, {list(shapes.values())}"
+        return new_batch
+
+
+    pref_dataset = pref_dataset.map(
+        process_dataset,
+        batched=True,
+        num_proc=32,
+        remove_columns=remove_columns,
+    )
+    
+    eval_pref_dataset = eval_pref_dataset.map(
+        process_dataset,
+        batched=True,
+        num_proc=32,
+        remove_columns=remove_columns,
+    )
+
+    data = defaultdict(lambda: defaultdict(list))
+    for row in tqdm.tqdm(pref_dataset, desc='Processing AF', disable=silent):
+        prompt = row['query']
+        responses = [row['response_w'], row['response_l']]
+        scores = [1, 0]
+        
+        pairs = []
+        for i in range(len(responses)):
+            for j in range(i + 1, len(responses)):
+                pairs.append((i, j) if scores[i] > scores[j] else (j, i))
+        
+        data[prompt]['pairs'] = responses
+        data[prompt]['responses'] = pairs
+        data[prompt]['sft_target'] = max(responses, key=lambda x: scores[responses.index(x)])
+
+    return data
 
 def get_dataset(name: str, split: str, silent: bool = False, cache_dir: str = None):
     """Load the given dataset by name. Supported by default are 'shp', 'hh', and 'se'."""
